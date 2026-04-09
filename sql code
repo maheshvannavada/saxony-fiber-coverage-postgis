@@ -1,1 +1,138 @@
+Setting up the project
 
+-- The data comes in as EPSG:4326 (lat/lon degrees) from Geofabrik.
+-- That's fine for display but useless for distance queries -- ST_DWithin
+-- with a 500 metre threshold needs actual metres, not degrees.
+-- UTM Zone 32N (EPSG:25832) covers Germany well, so reprojecting there.
+
+ALTER TABLE buildings
+  ALTER COLUMN geom TYPE geometry(Geometry, 25832)
+  USING ST_Transform(geom, 25832);
+
+ALTER TABLE roads
+  ALTER COLUMN geom TYPE geometry(Geometry, 25832)
+  USING ST_Transform(geom, 25832);
+
+-- Rebuild indexes after reprojection -- old ones are stale now
+CREATE INDEX idx_buildings_geom ON buildings USING GIST(geom);
+CREATE INDEX idx_roads_geom ON roads USING GIST(geom);
+
+------------------------------------------------------------------------------------------------------------------------------
+
+Generating fiber nodes
+-- No real fiber network data available for Saxony, so simulating one.
+-- The idea: fiber cables typically run underground along major roads,
+-- so interpolating points along primary/secondary/tertiary roads
+-- gives a reasonable approximation of where nodes might be.
+--
+-- 0.20 step = one node every ~20% of each road segment.
+-- Tried 0.02 first (4M nodes) -- way too heavy for the proximity joins.
+-- 0.20 gives 478k nodes which is manageable and still dense enough.
+
+CREATE TABLE generated_fiber_nodes AS
+SELECT
+    ROW_NUMBER() OVER () AS id,
+    ST_LineInterpolatePoint(
+        ST_LineMerge(geom),
+        gs.frac
+    ) AS geom
+FROM roads,
+     generate_series(0.0, 1.0, 0.20) AS gs(frac)
+WHERE fclass IN (
+    'primary', 'primary_link',
+    'secondary', 'secondary_link',
+    'tertiary', 'tertiary_link',
+    'trunk', 'trunk_link'
+);
+
+-- 478,218 nodes generated across Saxony
+CREATE INDEX idx_gen_fiber_geom
+    ON generated_fiber_nodes USING GIST(geom);
+
+-----------------------------------------------------------------------------------------------------------------------------
+Coverage Analysis
+-- Main question: how many buildings fall within 500m of a fiber node?
+-- 500m is the typical last-mile threshold used in German Glasfaserausbau planning.
+
+-- Quick summary first before creating full tables
+SELECT
+    (SELECT COUNT(*) FROM buildings) AS total_buildings,
+    COUNT(*) AS covered,
+    (SELECT COUNT(*) FROM buildings) - COUNT(*) AS uncovered,
+    ROUND(
+        100.0 * COUNT(*) / (SELECT COUNT(*) FROM buildings), 2
+    ) AS coverage_pct
+FROM buildings b
+WHERE EXISTS (
+    SELECT 1 FROM generated_fiber_nodes f
+    WHERE ST_DWithin(b.geom, f.geom, 500)
+);
+-- 1,617,348 covered / 1,794,566 total = 90.12%
+-- 177,218 buildings still outside 500m -- mostly rural areas and
+-- zones around railway corridors where road density drops off
+
+-- Saving results as separate tables for QGIS visualisation
+-- Only storing id + geom -- no need for all columns here
+
+CREATE TABLE final_covered_buildings AS
+SELECT b.id, b.geom
+FROM buildings b
+WHERE EXISTS (
+    SELECT 1 FROM generated_fiber_nodes f
+    WHERE ST_DWithin(b.geom, f.geom, 500)
+);
+CREATE INDEX idx_final_covered_geom
+    ON final_covered_buildings USING GIST(geom);
+
+CREATE TABLE final_uncovered_buildings AS
+SELECT b.id, b.geom
+FROM buildings b
+WHERE NOT EXISTS (
+    SELECT 1 FROM generated_fiber_nodes f
+    WHERE ST_DWithin(b.geom, f.geom, 500)
+);
+CREATE INDEX idx_final_uncovered_geom
+    ON final_uncovered_buildings USING GIST(geom);
+
+-------------------------------------------------------------------------------------------------------------------------------
+
+Performace Optimization
+
+
+-- Ran into a nasty slowdown early on. Original query used ::geography cast
+-- inside ST_DWithin which looked reasonable but killed performance.
+-- Took ~7 seconds on 1.79M buildings even with GIST indexes in place.
+--
+-- EXPLAIN ANALYZE showed "Parallel Seq Scan" -- indexes were being ignored.
+-- Turns out PostgreSQL can't use a geometry GIST index when you cast to
+-- geography inside the query. It falls back to sequential scan every time.
+
+-- The slow version (don't use this):
+-- SELECT COUNT(*) FROM buildings b
+-- WHERE NOT EXISTS (
+--     SELECT 1 FROM fiber_nodes f
+--     WHERE ST_DWithin(b.geom::geography, f.geom::geography, 500)
+-- );
+
+-- Fix: reproject to EPSG:25832 (metres) so 500 already means 500 metres.
+-- No geography cast needed, GIST index kicks in, query runs clean.
+
+SELECT COUNT(*) FROM buildings b
+WHERE NOT EXISTS (
+    SELECT 1 FROM generated_fiber_nodes f
+    WHERE ST_DWithin(b.geom, f.geom, 500)
+);
+-- Same result, dropped from ~7s to under 1s.
+
+-- Also worth noting: selecting b.* in CREATE TABLE AS was slower than
+-- just selecting b.id, b.geom -- made a noticeable difference at this scale.
+
+-- Check indexes are being used after reprojection:
+EXPLAIN ANALYZE
+SELECT COUNT(*) FROM buildings b
+WHERE NOT EXISTS (
+    SELECT 1 FROM generated_fiber_nodes f
+    WHERE ST_DWithin(b.geom, f.geom, 500)
+);
+-- Look for "Index Scan" or "Bitmap Index Scan" in output.
+-- "Seq Scan" means something is wrong with the index setup.
