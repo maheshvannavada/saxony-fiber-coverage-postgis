@@ -46,7 +46,7 @@ planning workflows used in Glasfaserausbau projects.
 ## SQL Queries
 | File | Description |
 |------|-------------|
-| [01_setup_reproject.sql](SQL Code/01_setup_reproject.sql) | CRS reprojection and index creation |
+| [01_setup_reproject.sql](sql/01_setup_reproject.sql) | CRS reprojection and index creation |
 | [02_generate_fiber_nodes.sql](sql/02_generate_fiber_nodes.sql) | Fiber node generation along roads |
 | [03_coverage_analysis.sql](sql/03_coverage_analysis.sql) | Coverage proximity analysis |
 | [04_performance_optimization.sql](sql/04_performance_optimization.sql) | Query optimisation notes |
